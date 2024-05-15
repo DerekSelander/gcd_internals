@@ -452,6 +452,106 @@ typedef void (*dispatch_mach_handler_function_t)(void *_Nullable context,
         dispatch_mach_reason_t reason, dispatch_mach_msg_t _Nullable message,
         mach_error_t error);
 
+struct dispatch_mach_send_refs_s {
+    dispatch_source_type_t du_type;
+    uintptr_t du_owner_wref;
+    volatile dispatch_unote_state_t du_state;
+    dispatch_unote_ident_t du_ident;
+    int8_t du_filter;
+    uint8_t du_is_direct : 1;
+    uint8_t du_is_timer : 1;
+    uint8_t du_has_extended_status : 1;
+    uint8_t du_memorypressure_override : 1;
+    uint8_t du_vmpressure_override : 1;
+    uint8_t du_can_be_wlh : 1;
+    uint8_t dmrr_handler_is_block : 1;
+    uint8_t du_unused_flag : 1;
+    union {
+        uint8_t du_timer_flags;
+        volatile bool dmsr_notification_armed;
+        bool dmr_reply_port_owned;
+    };
+    uint8_t du_unused;
+    uint32_t du_fflags;
+    unsigned long du_priority;
+    struct dispatch_unfair_lock_s dmsr_replies_lock;
+    struct dispatch_mach_msg_s dmsr_checkin;
+    
+    struct dispatch_mach_reply_refs_s *lh_first;
+    LIST_HEAD(, dispatch_mach_reply_refs_s) dmsr_replies;
+    union {
+        volatile uint64_t dmsr_state;
+        struct {
+            dispatch_unfair_lock_s dmsr_state_lock;
+            uint32_t dmsr_state_bits;
+        };
+    };
+    struct dispatch_object_s *volatile dmsr_tail;
+    struct dispatch_object_s *volatile dmsr_head;
+    volatile uint32_t dmsr_disconnect_cnt;
+    mach_port_t dmsr_send;
+    mach_port_t dmsr_checkin_port;
+};
+
+typedef struct dispatch_mach_send_refs_s* dispatch_mach_send_refs_t;
+
+struct dispatch_mach_s {
+    const struct dispatch_mach_msg_vtable_s *do_vtable;
+    volatile int do_ref_cnt;
+    volatile int do_xref_cnt;
+    struct dispatch_mach_s *volatile do_next;
+    struct dispatch_queue_s *do_targetq;
+    void *do_ctxt;
+    union {
+        dispatch_function_t do_finalizer;
+        void *do_introspection_ctxt;
+    };
+    struct dispatch_object_s *volatile dq_items_tail;
+    union {
+        volatile uint64_t dq_state;
+        struct {
+            dispatch_lock dq_state_lock;
+            uint32_t dq_state_bits;
+        };
+    };
+    unsigned long dq_serialnum;
+    const char *dq_label;
+    union {
+        volatile uint32_t dq_atomic_flags;
+        struct {
+            const uint16_t dq_width;
+            const uint16_t __dq_opaque2;
+        };
+    };
+    dispatch_priority_t dq_priority;
+    union {
+        struct dispatch_queue_specific_head_s *dq_specific_head;
+        struct dispatch_source_refs_s *ds_refs;
+        struct dispatch_timer_source_refs_s *ds_timer_refs;
+        struct dispatch_mach_recv_refs_s *dm_recv_refs;
+        const struct  dispatch_channel_callbacks_s *dch_callbacks;
+    };
+    volatile int dq_sref_cnt;
+    struct dispatch_unfair_lock_s dq_sidelock;
+    struct dispatch_object_s *volatile dq_items_head;
+    uint32_t dq_side_suspend_cnt;
+    uint16_t ds_is_installed : 1;
+    uint16_t ds_latched : 1;
+    uint16_t dm_connect_handler_called : 1;
+    uint16_t dm_cancel_handler_called : 1;
+    uint16_t dm_is_xpc : 1;
+    uint16_t dm_arm_no_senders : 1;
+    uint16_t dm_made_sendrights : 1;
+    uint16_t dm_strict_reply : 1;
+    uint16_t __ds_flags_pad : 8;
+//    uint16_t __dq_flags_separation[];
+    uint16_t dm_needs_mgr : 1;
+    uint16_t dm_disconnected : 1;
+    uint16_t __dm_flags_pad : 14;
+    struct dispatch_mach_send_refs_s* dm_send_refs;
+    struct dispatch_xpc_term_refs_s* dm_xpc_term_refs;
+};
+
 struct dispatch_mach_recv_refs_s {
     dispatch_source_type_t du_type;
     uintptr_t du_owner_wref;
@@ -872,10 +972,10 @@ int main(void) {
         __unused my_pthread_t *dispatch_thread = (void*)pthread_self();
         
 
-        __unused typeof(dispatch_tsd_indexes) *tsd  = &dispatch_tsd_indexes;
-        struct dispatch_queue_s *queue = pthread_getspecific(tsd->dti_queue_index);
-        
-        assert(queue == dispatch_thread->dispatch_queue_key);
+//        __unused typeof(dispatch_tsd_indexes) *tsd  = &dispatch_tsd_indexes;
+//        struct dispatch_queue_s *queue = pthread_getspecific(tsd->dti_queue_index);
+//        
+//        assert(queue == dispatch_thread->dispatch_queue_key);
         
         printf("");
         
@@ -1020,7 +1120,7 @@ int main(int argc, const char* argv[]) {
 }
 
 
-#elif defined(TEST8) // list the blocks waiting to be executed on the main dispatch queue
+#elif defined(TEST6) // list the blocks waiting to be executed on the main dispatch queue
 
 /* From queue_internal.h
  
@@ -1066,7 +1166,7 @@ int main(int argc, const char* argv[]) {
     
     return 0;
 }
-#elif defined(TEST9) // tests dispatch sources along with pthread offsets
+#elif defined(TEST7) // tests dispatch sources along with pthread offsets
 
 int main(int argc, const char* argv[]) {
     mach_port_options_t opts = {
@@ -1096,6 +1196,68 @@ int main(int argc, const char* argv[]) {
  
     dispatch_main();
 }
+#elif defined(TEST8) // tests dispatch sources along with pthread offsets
+#include <notify.h>
+
+typedef struct {
+    void *isa; // initialized an objc block cls
+    int flags;
+    int reserved;
+    void* invoke;
+    struct block_descriptor *descriptor;
+    // imported variables here, i.e. context's 0x123456789
+} Block_literal;
+
+static void(*og_function)(id, int) = NULL; // If a block had params, they'd go after the id block
+void interposed_function(id block, int cnt) {
+    if (og_function) {
+        og_function(block, cnt);
+    }
+}
+
+
+void some_repeating_timer(void(^callback)(int)) {
+    dispatch_queue_t queue = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0);
+    dispatch_async(queue, ^{
+        int count = 0;
+        sleep(2);
+        callback(count);
+    });
+}
+
+void malloc_ptr_enumerator(task_t task, void *context, unsigned type,
+                           vm_range_t *ranges, unsigned count) {
+    
+    for (uint i = 0; i < count; i++) {
+        uintptr_t *potential_block = (void*)ranges[i].address;
+        size_t sz = ranges[i].size;
+        
+        if (sz < sizeof(Block_literal)) {
+            continue;
+        }
+        
+        // see if the isa matches
+        void* stripped_isa = ptrauth_strip((void*)potential_block[0], ptrauth_key_objc_isa_pointer);
+        if (stripped_isa != context) {
+            continue;
+        }
+        
+        // do interposing on this instance of the block
+        malloc_printf("found address at %p\n", potential_block);
+    }
+    
+}
+
+int main(int argc, const char* argv[]) {
+
+    malloc_zone_t *zone = malloc_default_zone();
+    zone->introspect->force_lock(zone);
+    zone->introspect->enumerator(mach_task_self(), (__bridge void*)objc_getClass("__NSMallocBlock__"),
+                                 MALLOC_PTR_IN_USE_RANGE_TYPE, (vm_address_t)zone, NULL, malloc_ptr_enumerator);
+    zone->introspect->force_unlock(zone);
+    
+    dispatch_main();
+}
 
 #else
 #pragma mark - ex1 -
@@ -1106,10 +1268,6 @@ int main(void) {
     typedef struct {
         unsigned long int reserved;     // NULL
         unsigned long int size;         // sizeof(struct Block_literal_1)
-        // optional helper functions
-        void (*copy_helper)(void *dst, void *src);     // IFF (1<<25) 0x02000000
-        void (*dispose_helper)(void *src);             // IFF (1<<25) 0x02000000
-        // required ABI.2010.3.16
         const char *signature;                         // IFF (1<<30) 0x40000000
     } block_descriptor;
 
@@ -1119,20 +1277,17 @@ int main(void) {
         int reserved;
         void* fptr;
         block_descriptor *descriptor;
-        // imported variables here
+        // imported variables here, i.e. context's 0x123456789
     } Block_literal;
     
     void *context = (void*)0x123456789;
-    void *context2 = (void*)0x66666666666;
     
-    void (^Some_Block)(NSString*, uintptr_t, uintptr_t) =
-    ^(NSString *arg1, uintptr_t arg2, uintptr_t arg3) {
-            NSLog(@"arg1: %@, arg2: %lx, arg3: %lx, context: %p, context2: %p", 
-                                              arg1, arg2, arg3, context, context2);
+    void (^Some_Block)(NSString*, uintptr_t, uintptr_t) = ^(NSString *arg1, uintptr_t arg2, uintptr_t arg3) {
+        NSLog(@"arg1: %@, arg2: %lx, arg3: %lx, context: %p", arg1, arg2, arg3, context);
     };
     
     
-    Block_literal *b = (__bridge void*)Some_Block;
+    __unused Block_literal *b = (__bridge void*)Some_Block;
     
     Some_Block(@"HI", 1, 2);
     
